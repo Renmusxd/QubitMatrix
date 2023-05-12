@@ -1,4 +1,7 @@
 use num_traits::{One, Zero};
+use numpy::ndarray::Array1;
+use numpy::{PyArray1, PyReadonlyArray1, PyReadwriteArray1, ToPyArray};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::Python;
 use qip_iterators::iterators::MatrixOp;
@@ -21,6 +24,35 @@ impl TensorMatf64 {
         }
     }
 
+    fn apply(
+        &self,
+        py: Python,
+        input: PyReadonlyArray1<f64>,
+        output: Option<PyReadwriteArray1<f64>>,
+    ) -> PyResult<Option<Py<PyArray1<f64>>>> {
+        let input_slice = input
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        let len = input_slice.len();
+        if !len.is_power_of_two() {
+            return Err(PyValueError::new_err("Input array must be of length 2^n"));
+        }
+        if let Some(mut output) = output {
+            let output_slice = output
+                .as_slice_mut()
+                .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+            let n = two_power(len) as usize;
+            self.mat.apply_overwrite(n, input_slice, output_slice);
+            Ok(None)
+        } else {
+            let mut output = Array1::zeros((len,));
+            let output_slice = output.as_slice_mut().unwrap();
+            let n = two_power(len) as usize;
+            self.mat.apply_overwrite(n, input_slice, output_slice);
+            Ok(Some(output.to_pyarray(py).to_owned()))
+        }
+    }
+
     fn __add__(&self, other: &Self) -> Self {
         let mat = self.mat.clone().add(other.mat.clone());
         Self { mat }
@@ -30,6 +62,17 @@ impl TensorMatf64 {
         let mat = self.mat.clone().mul(other.mat.clone());
         Self { mat }
     }
+}
+
+fn two_power(x: usize) -> u32 {
+    let x = x.next_power_of_two();
+    let leading = x.leading_zeros();
+    // leading    two_power
+    // BITS-1     0
+    // BITS-2     1
+    // BITS-3     2
+    // so two_power = (BITS-1) - leading
+    (usize::BITS - 1) - leading
 }
 
 #[derive(Clone)]
