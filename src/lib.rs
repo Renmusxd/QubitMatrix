@@ -1,12 +1,15 @@
-use num_traits::{One, Zero};
+use num_traits::{Num, One, Zero};
 use numpy::ndarray::Array1;
-use numpy::{PyArray1, PyReadonlyArray1, PyReadwriteArray1, ToPyArray};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::Python;
-use qip_iterators::iterators::MatrixOp;
-use qip_iterators::matrix_ops::{apply_op, apply_op_overwrite, apply_op_row};
+use qip_iterators::iterators::{act_on_iterator, MatrixOp};
+use qip_iterators::matrix_ops::{
+    apply_op, apply_op_overwrite, apply_op_row, full_to_sub, get_index, sub_to_full,
+};
 use rayon::prelude::*;
+use sprs::*;
 use std::iter::Sum;
 use std::ops::{Add, AddAssign, Mul};
 
@@ -53,6 +56,30 @@ impl TensorMatf64 {
         }
     }
 
+    fn make_sparse(
+        &self,
+        py: Python,
+        n: usize,
+    ) -> (Py<PyArray1<usize>>, Py<PyArray1<usize>>, Py<PyArray1<f64>>) {
+        let sprs = self.mat.make_sparse(n);
+
+        let nn = sprs.iter().count();
+        let mut vals = Array1::zeros((nn,));
+        let mut rows = Array1::zeros((nn,));
+        let mut cols = Array1::zeros((nn,));
+        sprs.into_iter()
+            .enumerate()
+            .for_each(|(i, (x, (row, col)))| {
+                rows[i] = row;
+                cols[i] = col;
+                vals[i] = *x;
+            });
+        let vals = vals.into_pyarray(py).to_owned();
+        let rows = rows.into_pyarray(py).to_owned();
+        let cols = cols.into_pyarray(py).to_owned();
+        (rows, cols, vals)
+    }
+
     fn __add__(&self, other: &Self) -> Self {
         let mat = self.mat.clone().add(other.mat.clone());
         Self { mat }
@@ -82,6 +109,75 @@ pub enum MatrixTree<P> {
     Prod(Vec<MatrixTree<P>>),
     SumLeaf(Vec<MatrixOp<P>>),
     ProdLeaf(Vec<MatrixOp<P>>),
+}
+
+#[cfg(feature = "sparse")]
+impl<P> MatrixTree<P>
+where
+    P: Add + Num + Copy + Default + MulAcc + Zero + Send + Sync + One,
+    for<'r> &'r P: Add<&'r P, Output = P>,
+{
+    fn make_sparse(&self, n: usize) -> CsMat<P> {
+        match self {
+            MatrixTree::Leaf(op) => make_sparse_from_op(op, n),
+            MatrixTree::SumLeaf(ops) => ops
+                .iter()
+                .map(|op| make_sparse_from_op(op, n))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(&acc + &x),
+                })
+                .unwrap_or_else(|| CsMat::zero((1 << n, 1 << n))),
+            MatrixTree::Sum(ops) => ops
+                .iter()
+                .map(|op| op.make_sparse(n))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(&acc + &x),
+                })
+                .unwrap_or_else(|| CsMat::zero((1 << n, 1 << n))),
+            MatrixTree::ProdLeaf(ops) => ops
+                .iter()
+                .map(|op| make_sparse_from_op(op, n))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(&acc * &x),
+                })
+                .unwrap_or_else(|| CsMat::zero((1 << n, 1 << n))),
+            MatrixTree::Prod(ops) => ops
+                .iter()
+                .map(|op| op.make_sparse(n))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(&acc * &x),
+                })
+                .unwrap_or_else(|| CsMat::zero((1 << n, 1 << n))),
+        }
+    }
+}
+
+fn make_sparse_from_op<P>(op: &MatrixOp<P>, n: usize) -> CsMat<P>
+where
+    P: Clone + Zero + One + Num,
+{
+    let mut a = TriMat::new((1 << n, 1 << n));
+    let nindices = op.num_indices();
+
+    let mat_indices: Vec<usize> = (0..op.num_indices()).map(|i| get_index(op, i)).collect();
+    for row in 0..a.shape().0 {
+        let matrow = full_to_sub(n, &mat_indices, row);
+        act_on_iterator(nindices, matrow, op, |it| {
+            let f = |(i, val): (usize, P)| {
+                let vecrow = sub_to_full(n, &mat_indices, i, row);
+                (vecrow, val)
+            };
+
+            for (col, val) in it.map(f) {
+                a.add_triplet(row, col, val)
+            }
+        })
+    }
+    a.to_csr()
 }
 
 impl<P> MatrixTree<P>
