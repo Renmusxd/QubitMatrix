@@ -13,7 +13,7 @@ use rayon::prelude::*;
 #[cfg(feature = "sparse")]
 use sprs::*;
 use std::iter::Sum;
-use std::ops::{Add, AddAssign, Mul, MulAssign, Neg};
+use std::ops::{Add, AddAssign, Mul, Neg};
 
 macro_rules! tensor_class {
     ($name:ident, $t:ident) => {
@@ -148,23 +148,6 @@ where
             e.print_and_set_sys_last_vars(py);
             res
         })
-}
-
-#[derive(Clone)]
-struct OpWrapper<P> {
-    op: MatrixOp<P>,
-    negate: bool,
-    mult: Option<P>,
-}
-
-impl<P> From<MatrixOp<P>> for OpWrapper<P> {
-    fn from(op: MatrixOp<P>) -> Self {
-        Self {
-            op,
-            negate: false,
-            mult: None,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -410,6 +393,7 @@ where
     type Output = Self;
 
     fn neg(mut self) -> Self::Output {
+        self.negate();
         self
     }
 }
