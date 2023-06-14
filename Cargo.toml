@@ -12,9 +12,12 @@ default = ["sparse"]
 sparse = ["sprs"]
 
 [dependencies]
-qip-iterators = "^1.4"
 pyo3 = { version = "0.18", features = ["extension-module"] }
 numpy = "^0.18"
 num-traits = "^0.2"
 rayon = "^1.7"
 sprs = {version = "^0.11", optional = true}
+
+[dependencies.qip-iterators]
+version = "^1.4"
+path = "../RustQIP/qip-iterators"

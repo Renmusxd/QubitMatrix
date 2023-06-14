@@ -3,92 +3,116 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::IntoPyDict;
 use pyo3::Python;
 use qip_iterators::iterators::{act_on_iterator, MatrixOp};
 use qip_iterators::matrix_ops::{
     apply_op, apply_op_overwrite, apply_op_row, full_to_sub, get_index, sub_to_full,
 };
 use rayon::prelude::*;
+#[cfg(feature = "sparse")]
 use sprs::*;
 use std::iter::Sum;
-use std::ops::{Add, AddAssign, Mul};
+use std::ops::{Add, AddAssign, Mul, MulAssign, Neg};
 
-#[pyclass]
-pub struct TensorMatf64 {
-    mat: MatrixTree<f64>,
-}
-
-#[pymethods]
-impl TensorMatf64 {
-    #[new]
-    fn new(indices: Vec<usize>, data: Vec<f64>) -> Self {
-        Self {
-            mat: MatrixTree::Leaf(MatrixOp::new_matrix(indices, data)),
+macro_rules! tensor_class {
+    ($name:ident, $t:ident) => {
+        #[pyclass]
+        pub struct $name {
+            mat: MatrixTree<$t>,
         }
-    }
 
-    fn apply(
-        &self,
-        py: Python,
-        input: PyReadonlyArray1<f64>,
-        output: Option<PyReadwriteArray1<f64>>,
-    ) -> PyResult<Option<Py<PyArray1<f64>>>> {
-        let input_slice = input
-            .as_slice()
-            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
-        let len = input_slice.len();
-        if !len.is_power_of_two() {
-            return Err(PyValueError::new_err("Input array must be of length 2^n"));
+        #[pymethods]
+        impl $name {
+            #[new]
+            fn new(indices: Vec<usize>, data: Vec<$t>) -> Self {
+                Self {
+                    mat: MatrixTree::Leaf(MatrixOp::new_matrix(indices, data).into()),
+                }
+            }
+
+            fn apply(
+                &self,
+                py: Python,
+                input: PyReadonlyArray1<$t>,
+                output: Option<PyReadwriteArray1<$t>>,
+            ) -> PyResult<Option<Py<PyArray1<$t>>>> {
+                let input_slice = input
+                    .as_slice()
+                    .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+                let len = input_slice.len();
+                if !len.is_power_of_two() {
+                    return Err(PyValueError::new_err("Input array must be of length 2^n"));
+                }
+                if let Some(mut output) = output {
+                    let output_slice = output
+                        .as_slice_mut()
+                        .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+                    let n = two_power(len) as usize;
+                    self.mat.apply_overwrite(n, input_slice, output_slice);
+                    Ok(None)
+                } else {
+                    let mut output = Array1::zeros((len,));
+                    let output_slice = output.as_slice_mut().unwrap();
+                    let n = two_power(len) as usize;
+                    self.mat.apply_overwrite(n, input_slice, output_slice);
+                    Ok(Some(output.to_pyarray(py).to_owned()))
+                }
+            }
+
+            fn make_sparse(
+                &self,
+                py: Python,
+                n: usize,
+            ) -> (Py<PyArray1<usize>>, Py<PyArray1<usize>>, Py<PyArray1<$t>>) {
+                let sprs = self.mat.make_sparse(n);
+
+                let nn = sprs.iter().count();
+                let mut vals = Array1::zeros((nn,));
+                let mut rows = Array1::zeros((nn,));
+                let mut cols = Array1::zeros((nn,));
+                sprs.into_iter()
+                    .enumerate()
+                    .for_each(|(i, (x, (row, col)))| {
+                        rows[i] = row;
+                        cols[i] = col;
+                        vals[i] = *x;
+                    });
+                let vals = vals.into_pyarray(py).to_owned();
+                let rows = rows.into_pyarray(py).to_owned();
+                let cols = cols.into_pyarray(py).to_owned();
+                (rows, cols, vals)
+            }
+
+            #[cfg(feature = "sparse")]
+            fn get_sparse<'a>(&self, py: Python<'a>, n: usize) -> PyResult<&'a PyAny> {
+                let sprs = self.mat.make_sparse(n);
+                scipy_mat(py, &sprs)
+                    .map(|e| e)
+                    .map_err(|e| PyValueError::new_err(e))
+            }
+
+            fn __add__(&self, other: &Self) -> Self {
+                let mat = self.mat.clone().add(other.mat.clone());
+                Self { mat }
+            }
+
+            fn __sub__(&self, other: &Self) -> Self {
+                let mat = self.mat.clone().add(other.mat.clone().neg());
+                Self { mat }
+            }
+
+            fn __neg__(&self) -> Self {
+                let mat = self.mat.clone().neg();
+                Self { mat }
+            }
+
+            fn __matmul__(&self, other: &Self) -> Self {
+                let mat = self.mat.clone().mul(other.mat.clone());
+                Self { mat }
+            }
         }
-        if let Some(mut output) = output {
-            let output_slice = output
-                .as_slice_mut()
-                .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
-            let n = two_power(len) as usize;
-            self.mat.apply_overwrite(n, input_slice, output_slice);
-            Ok(None)
-        } else {
-            let mut output = Array1::zeros((len,));
-            let output_slice = output.as_slice_mut().unwrap();
-            let n = two_power(len) as usize;
-            self.mat.apply_overwrite(n, input_slice, output_slice);
-            Ok(Some(output.to_pyarray(py).to_owned()))
-        }
-    }
-
-    fn make_sparse(
-        &self,
-        py: Python,
-        n: usize,
-    ) -> (Py<PyArray1<usize>>, Py<PyArray1<usize>>, Py<PyArray1<f64>>) {
-        let sprs = self.mat.make_sparse(n);
-
-        let nn = sprs.iter().count();
-        let mut vals = Array1::zeros((nn,));
-        let mut rows = Array1::zeros((nn,));
-        let mut cols = Array1::zeros((nn,));
-        sprs.into_iter()
-            .enumerate()
-            .for_each(|(i, (x, (row, col)))| {
-                rows[i] = row;
-                cols[i] = col;
-                vals[i] = *x;
-            });
-        let vals = vals.into_pyarray(py).to_owned();
-        let rows = rows.into_pyarray(py).to_owned();
-        let cols = cols.into_pyarray(py).to_owned();
-        (rows, cols, vals)
-    }
-
-    fn __add__(&self, other: &Self) -> Self {
-        let mat = self.mat.clone().add(other.mat.clone());
-        Self { mat }
-    }
-
-    fn __matmul__(&self, other: &Self) -> Self {
-        let mat = self.mat.clone().mul(other.mat.clone());
-        Self { mat }
-    }
+    };
 }
 
 fn two_power(x: usize) -> u32 {
@@ -100,6 +124,47 @@ fn two_power(x: usize) -> u32 {
     // BITS-3     2
     // so two_power = (BITS-1) - leading
     (usize::BITS - 1) - leading
+}
+
+#[cfg(feature = "sparse")]
+fn scipy_mat<'a, P>(py: Python<'a>, mat: &CsMat<P>) -> Result<&'a PyAny, String>
+where
+    P: Clone + IntoPy<Py<PyAny>>,
+{
+    let scipy_sparse = PyModule::import(py, "scipy.sparse").map_err(|e| {
+        let res = format!("Python error: {e:?}");
+        e.print_and_set_sys_last_vars(py);
+        res
+    })?;
+    let indptr = mat.indptr().to_proper().to_vec();
+    scipy_sparse
+        .call_method(
+            "csr_matrix",
+            ((mat.data().to_vec(), mat.indices().to_vec(), indptr),),
+            Some([("shape", mat.shape())].into_py_dict(py)),
+        )
+        .map_err(|e| {
+            let res = format!("Python error: {e:?}");
+            e.print_and_set_sys_last_vars(py);
+            res
+        })
+}
+
+#[derive(Clone)]
+struct OpWrapper<P> {
+    op: MatrixOp<P>,
+    negate: bool,
+    mult: Option<P>,
+}
+
+impl<P> From<MatrixOp<P>> for OpWrapper<P> {
+    fn from(op: MatrixOp<P>) -> Self {
+        Self {
+            op,
+            negate: false,
+            mult: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -296,6 +361,59 @@ impl<P> Add for MatrixTree<P> {
     }
 }
 
+fn negate_op<P>(op: &mut MatrixOp<P>)
+where
+    P: Neg<Output = P> + Clone,
+{
+    match op {
+        MatrixOp::Matrix(_, d) => d.iter_mut().for_each(|x| *x = x.clone().neg()),
+        MatrixOp::SparseMatrix(_, d) => d
+            .iter_mut()
+            .flat_map(|x| x.iter_mut())
+            .for_each(|(_, x)| *x = x.clone().neg()),
+        MatrixOp::Swap(_, _) => {
+            unimplemented!()
+        }
+        MatrixOp::Control(_, _, _) => {
+            unimplemented!()
+        }
+    }
+}
+
+impl<P> MatrixTree<P>
+where
+    P: Neg<Output = P> + Clone,
+{
+    fn negate(&mut self) {
+        match self {
+            MatrixTree::Leaf(x) => negate_op(x),
+            MatrixTree::SumLeaf(x) => x.iter_mut().for_each(|x| negate_op(x)),
+            MatrixTree::ProdLeaf(x) => {
+                if let Some(x) = x.first_mut() {
+                    negate_op(x)
+                }
+            }
+            MatrixTree::Sum(x) => x.iter_mut().for_each(|x| x.negate()),
+            MatrixTree::Prod(x) => {
+                if let Some(x) = x.first_mut() {
+                    x.negate()
+                }
+            }
+        }
+    }
+}
+
+impl<P> Neg for MatrixTree<P>
+where
+    P: Neg<Output = P> + Clone,
+{
+    type Output = Self;
+
+    fn neg(mut self) -> Self::Output {
+        self
+    }
+}
+
 impl<P> Mul for MatrixTree<P> {
     type Output = MatrixTree<P>;
 
@@ -331,8 +449,20 @@ impl<P> Mul for MatrixTree<P> {
     }
 }
 
+tensor_class!(TensorMatf64, f64);
+tensor_class!(TensorMatf32, f32);
+tensor_class!(TensorMati64, i64);
+tensor_class!(TensorMati32, i32);
+// tensor_class!(TensorMatu64, u64);
+// tensor_class!(TensorMatu32, u32);
+
 #[pymodule]
 fn qubit_matmul(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<TensorMatf64>()?;
+    m.add_class::<TensorMatf32>()?;
+    m.add_class::<TensorMati64>()?;
+    m.add_class::<TensorMati32>()?;
+    // m.add_class::<TensorMatu64>()?;
+    // m.add_class::<TensorMatu32>()?;
     Ok(())
 }
