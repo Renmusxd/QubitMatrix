@@ -1,6 +1,6 @@
 use num_traits::{Num, One, Zero};
-use numpy::ndarray::Array1;
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1, ToPyArray};
+use numpy::ndarray::{Array1, Array2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadwriteArray1, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
@@ -60,6 +60,7 @@ macro_rules! tensor_class {
                 }
             }
 
+            #[cfg(feature = "sparse")]
             fn make_sparse(
                 &self,
                 py: Python,
@@ -92,19 +93,26 @@ macro_rules! tensor_class {
                     .map_err(|e| PyValueError::new_err(e))
             }
 
+            #[cfg(feature = "sparse")]
+            fn get_dense<'a>(&self, py: Python<'a>, n: usize) -> Py<PyArray2<$t>> {
+                self.mat.make_dense(n).into_pyarray(py).to_owned()
+            }
+
             fn __add__(&self, other: &Self) -> Self {
                 let mat = self.mat.clone().add(other.mat.clone());
                 Self { mat }
             }
 
-            fn __sub__(&self, other: &Self) -> Self {
-                let mat = self.mat.clone().add(other.mat.clone().neg());
-                Self { mat }
+            fn __sub__(&self, other: &Self) -> PyResult<Self> {
+                let other = other.__neg__()?;
+                let mat = self.mat.clone().add(other.mat);
+                Ok(Self { mat })
             }
 
-            fn __neg__(&self) -> Self {
-                let mat = self.mat.clone().neg();
-                Self { mat }
+            fn __neg__(&self) -> PyResult<Self> {
+                let mut mat = self.mat.clone();
+                mat.negate().map_err(PyValueError::new_err)?;
+                Ok(Self { mat })
             }
 
             fn __matmul__(&self, other: &Self) -> Self {
@@ -230,6 +238,74 @@ where
 
 impl<P> MatrixTree<P>
 where
+    P: Add + Num + Copy + Default + MulAcc + Zero + Send + Sync + One + 'static,
+    for<'r> &'r P: Add<&'r P, Output = P>,
+{
+    fn make_dense(&self, n: usize) -> Array2<P> {
+        match self {
+            MatrixTree::Leaf(op) => make_dense_from_op(op, n),
+            MatrixTree::SumLeaf(ops) => ops
+                .iter()
+                .map(|op| make_dense_from_op(op, n))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(&acc + &x),
+                })
+                .unwrap_or_else(|| Array2::zeros((1 << n, 1 << n))),
+            MatrixTree::Sum(ops) => ops
+                .iter()
+                .map(|op| op.make_dense(n))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(&acc + &x),
+                })
+                .unwrap_or_else(|| Array2::zeros((1 << n, 1 << n))),
+            MatrixTree::ProdLeaf(ops) => ops
+                .iter()
+                .map(|op| make_dense_from_op(op, n))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(acc.dot(&x)),
+                })
+                .unwrap_or_else(|| Array2::zeros((1 << n, 1 << n))),
+            MatrixTree::Prod(ops) => ops
+                .iter()
+                .map(|op| op.make_dense(n))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(acc.dot(&x)),
+                })
+                .unwrap_or_else(|| Array2::zeros((1 << n, 1 << n))),
+        }
+    }
+}
+
+fn make_dense_from_op<P>(op: &MatrixOp<P>, n: usize) -> Array2<P>
+where
+    P: Clone + Zero + One + Num,
+{
+    let mut a = Array2::zeros((1 << n, 1 << n));
+    let nindices = op.num_indices();
+
+    let mat_indices: Vec<usize> = (0..op.num_indices()).map(|i| get_index(op, i)).collect();
+    for row in 0..a.shape()[0] {
+        let matrow = full_to_sub(n, &mat_indices, row);
+        act_on_iterator(nindices, matrow, op, |it| {
+            let f = |(i, val): (usize, P)| {
+                let vecrow = sub_to_full(n, &mat_indices, i, row);
+                (vecrow, val)
+            };
+
+            for (col, val) in it.map(f) {
+                a[(row, col)] = val;
+            }
+        })
+    }
+    a
+}
+
+impl<P> MatrixTree<P>
+where
     P: Sync + Send + Zero + One + Sum + Clone + AddAssign,
 {
     pub fn apply_add(&self, n: usize, input: &[P], output: &mut [P]) {
@@ -344,7 +420,7 @@ impl<P> Add for MatrixTree<P> {
     }
 }
 
-fn negate_op<P>(op: &mut MatrixOp<P>)
+fn negate_op<P>(op: &mut MatrixOp<P>) -> Result<(), String>
 where
     P: Neg<Output = P> + Clone,
 {
@@ -355,46 +431,39 @@ where
             .flat_map(|x| x.iter_mut())
             .for_each(|(_, x)| *x = x.clone().neg()),
         MatrixOp::Swap(_, _) => {
-            unimplemented!()
+            return Err("Negating swap operations not yet implemented".to_string())
         }
         MatrixOp::Control(_, _, _) => {
-            unimplemented!()
+            return Err("Negating control operations not yet implemented".to_string())
         }
     }
+    Ok(())
 }
 
 impl<P> MatrixTree<P>
 where
     P: Neg<Output = P> + Clone,
 {
-    fn negate(&mut self) {
+    fn negate(&mut self) -> Result<(), String> {
         match self {
             MatrixTree::Leaf(x) => negate_op(x),
-            MatrixTree::SumLeaf(x) => x.iter_mut().for_each(|x| negate_op(x)),
+            MatrixTree::SumLeaf(x) => x.iter_mut().try_for_each(|x| negate_op(x)),
             MatrixTree::ProdLeaf(x) => {
                 if let Some(x) = x.first_mut() {
                     negate_op(x)
+                } else {
+                    Ok(())
                 }
             }
-            MatrixTree::Sum(x) => x.iter_mut().for_each(|x| x.negate()),
+            MatrixTree::Sum(x) => x.iter_mut().try_for_each(|x| x.negate()),
             MatrixTree::Prod(x) => {
                 if let Some(x) = x.first_mut() {
                     x.negate()
+                } else {
+                    Ok(())
                 }
             }
         }
-    }
-}
-
-impl<P> Neg for MatrixTree<P>
-where
-    P: Neg<Output = P> + Clone,
-{
-    type Output = Self;
-
-    fn neg(mut self) -> Self::Output {
-        self.negate();
-        self
     }
 }
 
