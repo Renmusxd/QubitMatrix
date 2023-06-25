@@ -13,10 +13,11 @@ use rayon::prelude::*;
 #[cfg(feature = "sparse")]
 use sprs::*;
 use std::iter::Sum;
-use std::ops::{Add, AddAssign, Mul, Neg};
+use std::ops::{Add, AddAssign, DivAssign, Mul, MulAssign, Neg};
 
+// Repeated code because pyo3 and macros not playing well together.
 macro_rules! tensor_class {
-    ($name:ident, $t:ident) => {
+    (nonegate, $name:ident, $t:ty) => {
         #[pyclass]
         pub struct $name {
             mat: MatrixTree<$t>,
@@ -93,13 +94,118 @@ macro_rules! tensor_class {
                     .map_err(|e| PyValueError::new_err(e))
             }
 
-            #[cfg(feature = "sparse")]
-            fn get_dense<'a>(&self, py: Python<'a>, n: usize) -> Py<PyArray2<$t>> {
+            fn get_dense(&self, py: Python, n: usize) -> Py<PyArray2<$t>> {
                 self.mat.make_dense(n).into_pyarray(py).to_owned()
             }
 
             fn __add__(&self, other: &Self) -> Self {
                 let mat = self.mat.clone().add(other.mat.clone());
+                Self { mat }
+            }
+
+            fn __matmul__(&self, other: &Self) -> Self {
+                let mat = self.mat.clone().mul(other.mat.clone());
+                Self { mat }
+            }
+
+            fn __sub__(&self, _other: &Self) -> PyResult<Self> {
+                Err(PyValueError::new_err("Cannot negate this array type"))
+            }
+
+            fn __neg__(&self) -> PyResult<Self> {
+                Err(PyValueError::new_err("Cannot negate this array type"))
+            }
+        }
+    };
+
+    ($name:ident, $t:ty) => {
+        #[pyclass]
+        pub struct $name {
+            mat: MatrixTree<$t>,
+        }
+
+        #[pymethods]
+        impl $name {
+            #[new]
+            fn new(indices: Vec<usize>, data: Vec<$t>) -> Self {
+                Self {
+                    mat: MatrixTree::Leaf(MatrixOp::new_matrix(indices, data).into()),
+                }
+            }
+
+            fn apply(
+                &self,
+                py: Python,
+                input: PyReadonlyArray1<$t>,
+                output: Option<PyReadwriteArray1<$t>>,
+            ) -> PyResult<Option<Py<PyArray1<$t>>>> {
+                let input_slice = input
+                    .as_slice()
+                    .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+                let len = input_slice.len();
+                if !len.is_power_of_two() {
+                    return Err(PyValueError::new_err("Input array must be of length 2^n"));
+                }
+                if let Some(mut output) = output {
+                    let output_slice = output
+                        .as_slice_mut()
+                        .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+                    let n = two_power(len) as usize;
+                    self.mat.apply_overwrite(n, input_slice, output_slice);
+                    Ok(None)
+                } else {
+                    let mut output = Array1::zeros((len,));
+                    let output_slice = output.as_slice_mut().unwrap();
+                    let n = two_power(len) as usize;
+                    self.mat.apply_overwrite(n, input_slice, output_slice);
+                    Ok(Some(output.to_pyarray(py).to_owned()))
+                }
+            }
+
+            #[cfg(feature = "sparse")]
+            fn make_sparse(
+                &self,
+                py: Python,
+                n: usize,
+            ) -> (Py<PyArray1<usize>>, Py<PyArray1<usize>>, Py<PyArray1<$t>>) {
+                let sprs = self.mat.make_sparse(n);
+
+                let nn = sprs.iter().count();
+                let mut vals = Array1::zeros((nn,));
+                let mut rows = Array1::zeros((nn,));
+                let mut cols = Array1::zeros((nn,));
+                sprs.into_iter()
+                    .enumerate()
+                    .for_each(|(i, (x, (row, col)))| {
+                        rows[i] = row;
+                        cols[i] = col;
+                        vals[i] = *x;
+                    });
+                let vals = vals.into_pyarray(py).to_owned();
+                let rows = rows.into_pyarray(py).to_owned();
+                let cols = cols.into_pyarray(py).to_owned();
+                (rows, cols, vals)
+            }
+
+            #[cfg(feature = "sparse")]
+            fn get_sparse<'a>(&self, py: Python<'a>, n: usize) -> PyResult<&'a PyAny> {
+                let sprs = self.mat.make_sparse(n);
+                scipy_mat(py, &sprs)
+                    .map(|e| e)
+                    .map_err(|e| PyValueError::new_err(e))
+            }
+
+            fn get_dense(&self, py: Python, n: usize) -> Py<PyArray2<$t>> {
+                self.mat.make_dense(n).into_pyarray(py).to_owned()
+            }
+
+            fn __add__(&self, other: &Self) -> Self {
+                let mat = self.mat.clone().add(other.mat.clone());
+                Self { mat }
+            }
+
+            fn __matmul__(&self, other: &Self) -> Self {
+                let mat = self.mat.clone().mul(other.mat.clone());
                 Self { mat }
             }
 
@@ -115,9 +221,18 @@ macro_rules! tensor_class {
                 Ok(Self { mat })
             }
 
-            fn __matmul__(&self, other: &Self) -> Self {
-                let mat = self.mat.clone().mul(other.mat.clone());
-                Self { mat }
+            fn __mul__(&self, other: $t) -> PyResult<Self> {
+                let mat = self.mat.clone();
+                Ok(Self {
+                    mat: mat.scalar_mul(other),
+                })
+            }
+
+            fn __div__(&self, other: $t) -> PyResult<Self> {
+                let mat = self.mat.clone();
+                Ok(Self {
+                    mat: mat.scalar_div(other),
+                })
             }
         }
     };
@@ -165,12 +280,14 @@ pub enum MatrixTree<P> {
     Prod(Vec<MatrixTree<P>>),
     SumLeaf(Vec<MatrixOp<P>>),
     ProdLeaf(Vec<MatrixOp<P>>),
+    Mul(Box<MatrixTree<P>>, P),
+    Div(Box<MatrixTree<P>>, P),
 }
 
 #[cfg(feature = "sparse")]
 impl<P> MatrixTree<P>
 where
-    P: Add + Num + Copy + Default + MulAcc + Zero + Send + Sync + One,
+    P: Add + Num + Copy + Default + MulAcc + Zero + Send + Sync + One + MulAssign + DivAssign,
     for<'r> &'r P: Add<&'r P, Output = P>,
 {
     fn make_sparse(&self, n: usize) -> CsMat<P> {
@@ -208,6 +325,16 @@ where
                     Some(acc) => Some(&acc * &x),
                 })
                 .unwrap_or_else(|| CsMat::zero((1 << n, 1 << n))),
+            MatrixTree::Mul(tree, mul) => {
+                let mut sparse = tree.make_sparse(n);
+                sparse.data_mut().iter_mut().for_each(|x| *x *= *mul);
+                sparse
+            }
+            MatrixTree::Div(tree, div) => {
+                let mut sparse = tree.make_sparse(n);
+                sparse.data_mut().iter_mut().for_each(|x| *x /= *div);
+                sparse
+            }
         }
     }
 }
@@ -238,7 +365,18 @@ where
 
 impl<P> MatrixTree<P>
 where
-    P: Add + Num + Copy + Default + MulAcc + Zero + Send + Sync + One + 'static,
+    P: Add
+        + Num
+        + Copy
+        + Default
+        + MulAcc
+        + Zero
+        + Send
+        + Sync
+        + One
+        + MulAssign
+        + DivAssign
+        + 'static,
     for<'r> &'r P: Add<&'r P, Output = P>,
 {
     fn make_dense(&self, n: usize) -> Array2<P> {
@@ -276,6 +414,16 @@ where
                     Some(acc) => Some(acc.dot(&x)),
                 })
                 .unwrap_or_else(|| Array2::zeros((1 << n, 1 << n))),
+            MatrixTree::Mul(tree, mul) => {
+                let mut dense = tree.make_dense(n);
+                dense.iter_mut().for_each(|x| *x *= *mul);
+                dense
+            }
+            MatrixTree::Div(tree, div) => {
+                let mut dense = tree.make_dense(n);
+                dense.iter_mut().for_each(|x| *x /= *div);
+                dense
+            }
         }
     }
 }
@@ -306,7 +454,7 @@ where
 
 impl<P> MatrixTree<P>
 where
-    P: Sync + Send + Zero + One + Sum + Clone + AddAssign,
+    P: Sync + Send + Zero + One + Sum + Copy + Clone + AddAssign + MulAssign + DivAssign,
 {
     pub fn apply_add(&self, n: usize, input: &[P], output: &mut [P]) {
         match self {
@@ -320,7 +468,7 @@ where
                 });
             }
             MatrixTree::Sum(ops) => ops.iter().for_each(|op| op.apply_add(n, input, output)),
-            MatrixTree::ProdLeaf(_) | MatrixTree::Prod(_) => {
+            _ => {
                 let out_copy = output.to_vec();
                 self.apply_overwrite(n, input, output);
                 output
@@ -350,7 +498,7 @@ where
                 [] => output
                     .iter_mut()
                     .zip(input.iter())
-                    .for_each(|(a, b)| *a = b.clone()),
+                    .for_each(|(a, b)| *a = *b),
                 [op] => {
                     apply_op_overwrite(n, op, input, output, 0, 0);
                 }
@@ -372,7 +520,7 @@ where
                 [] => output
                     .iter_mut()
                     .zip(input.iter())
-                    .for_each(|(a, b)| *a = b.clone()),
+                    .for_each(|(a, b)| *a = *b),
                 [op] => op.apply_overwrite(n, input, output),
                 [op, ops @ ..] => {
                     let mut buffer = vec![P::zero(); output.len()];
@@ -388,6 +536,15 @@ where
                     });
                 }
             },
+            MatrixTree::Mul(tree, mul) => {
+                tree.apply_overwrite(n, input, output);
+                output.iter_mut().for_each(|x| *x *= *mul);
+            }
+
+            MatrixTree::Div(tree, div) => {
+                tree.apply_overwrite(n, input, output);
+                output.iter_mut().for_each(|x| *x /= *div);
+            }
         }
     }
 }
@@ -442,7 +599,7 @@ where
 
 impl<P> MatrixTree<P>
 where
-    P: Neg<Output = P> + Clone,
+    P: Neg<Output = P> + Copy,
 {
     fn negate(&mut self) -> Result<(), String> {
         match self {
@@ -463,7 +620,24 @@ where
                     Ok(())
                 }
             }
+            MatrixTree::Mul(_, mul) => {
+                *mul = mul.neg();
+                Ok(())
+            }
+            MatrixTree::Div(_, div) => {
+                *div = div.neg();
+                Ok(())
+            }
         }
+    }
+}
+
+impl<P> MatrixTree<P> {
+    fn scalar_mul(self, other: P) -> Self {
+        MatrixTree::Mul(Box::new(self), other)
+    }
+    fn scalar_div(self, other: P) -> Self {
+        MatrixTree::Div(Box::new(self), other)
     }
 }
 
@@ -502,20 +676,24 @@ impl<P> Mul for MatrixTree<P> {
     }
 }
 
+// tensor_class!(TensorMatc64, Complex64);
+// tensor_class!(TensorMatc32, Complex32);
 tensor_class!(TensorMatf64, f64);
 tensor_class!(TensorMatf32, f32);
 tensor_class!(TensorMati64, i64);
 tensor_class!(TensorMati32, i32);
-// tensor_class!(TensorMatu64, u64);
-// tensor_class!(TensorMatu32, u32);
+tensor_class!(nonegate, TensorMatu64, u64);
+tensor_class!(nonegate, TensorMatu32, u32);
 
 #[pymodule]
 fn qubit_matmul(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+    // m.add_class::<TensorMatc64>()?;
+    // m.add_class::<TensorMatc32>()?;
     m.add_class::<TensorMatf64>()?;
     m.add_class::<TensorMatf32>()?;
     m.add_class::<TensorMati64>()?;
     m.add_class::<TensorMati32>()?;
-    // m.add_class::<TensorMatu64>()?;
-    // m.add_class::<TensorMatu32>()?;
+    m.add_class::<TensorMatu64>()?;
+    m.add_class::<TensorMatu32>()?;
     Ok(())
 }
