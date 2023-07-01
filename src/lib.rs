@@ -1,5 +1,7 @@
 use num_traits::{Num, One, Zero};
 use numpy::ndarray::{Array1, Array2};
+use numpy::Complex32;
+use numpy::Complex64;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadwriteArray1, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -17,6 +19,100 @@ use std::ops::{Add, AddAssign, DivAssign, Mul, MulAssign, Neg};
 
 // Repeated code because pyo3 and macros not playing well together.
 macro_rules! tensor_class {
+    (noscipy, $name:ident, $t:ty) => {
+        #[pyclass]
+        pub struct $name {
+            mat: MatrixTree<$t>,
+        }
+
+        #[pymethods]
+        impl $name {
+            #[new]
+            fn new(indices: Vec<usize>, data: PyReadonlyArray1<$t>) -> Self {
+                let data = data.to_vec().unwrap();
+                Self {
+                    mat: MatrixTree::Leaf(MatrixOp::new_matrix(indices, data).into()),
+                }
+            }
+
+            fn apply(
+                &self,
+                py: Python,
+                input: PyReadonlyArray1<$t>,
+                output: Option<PyReadwriteArray1<$t>>,
+            ) -> PyResult<Option<Py<PyArray1<$t>>>> {
+                let input_slice = input
+                    .as_slice()
+                    .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+                let len = input_slice.len();
+                if !len.is_power_of_two() {
+                    return Err(PyValueError::new_err("Input array must be of length 2^n"));
+                }
+                if let Some(mut output) = output {
+                    let output_slice = output
+                        .as_slice_mut()
+                        .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+                    let n = two_power(len) as usize;
+                    self.mat.apply_overwrite(n, input_slice, output_slice);
+                    Ok(None)
+                } else {
+                    let mut output = Array1::zeros((len,));
+                    let output_slice = output.as_slice_mut().unwrap();
+                    let n = two_power(len) as usize;
+                    self.mat.apply_overwrite(n, input_slice, output_slice);
+                    Ok(Some(output.to_pyarray(py).to_owned()))
+                }
+            }
+
+            #[cfg(feature = "sparse")]
+            fn make_sparse(
+                &self,
+                py: Python,
+                n: usize,
+            ) -> (Py<PyArray1<usize>>, Py<PyArray1<usize>>, Py<PyArray1<$t>>) {
+                let sprs = self.mat.make_sparse(n);
+
+                let nn = sprs.iter().count();
+                let mut vals = Array1::zeros((nn,));
+                let mut rows = Array1::zeros((nn,));
+                let mut cols = Array1::zeros((nn,));
+                sprs.into_iter()
+                    .enumerate()
+                    .for_each(|(i, (x, (row, col)))| {
+                        rows[i] = row;
+                        cols[i] = col;
+                        vals[i] = *x;
+                    });
+                let vals = vals.into_pyarray(py).to_owned();
+                let rows = rows.into_pyarray(py).to_owned();
+                let cols = cols.into_pyarray(py).to_owned();
+                (rows, cols, vals)
+            }
+
+            fn get_dense(&self, py: Python, n: usize) -> Py<PyArray2<$t>> {
+                self.mat.make_dense(n).into_pyarray(py).to_owned()
+            }
+
+            fn __add__(&self, other: &Self) -> Self {
+                let mat = self.mat.clone().add(other.mat.clone());
+                Self { mat }
+            }
+
+            fn __matmul__(&self, other: &Self) -> Self {
+                let mat = self.mat.clone().mul(other.mat.clone());
+                Self { mat }
+            }
+
+            fn __sub__(&self, _other: &Self) -> PyResult<Self> {
+                Err(PyValueError::new_err("Cannot negate this array type"))
+            }
+
+            fn __neg__(&self) -> PyResult<Self> {
+                Err(PyValueError::new_err("Cannot negate this array type"))
+            }
+        }
+    };
+
     (nonegate, $name:ident, $t:ty) => {
         #[pyclass]
         pub struct $name {
@@ -26,7 +122,8 @@ macro_rules! tensor_class {
         #[pymethods]
         impl $name {
             #[new]
-            fn new(indices: Vec<usize>, data: Vec<$t>) -> Self {
+            fn new(indices: Vec<usize>, data: PyReadonlyArray1<$t>) -> Self {
+                let data = data.to_vec().unwrap();
                 Self {
                     mat: MatrixTree::Leaf(MatrixOp::new_matrix(indices, data).into()),
                 }
@@ -127,7 +224,8 @@ macro_rules! tensor_class {
         #[pymethods]
         impl $name {
             #[new]
-            fn new(indices: Vec<usize>, data: Vec<$t>) -> Self {
+            fn new(indices: Vec<usize>, data: PyReadonlyArray1<$t>) -> Self {
+                let data = data.to_vec().unwrap();
                 Self {
                     mat: MatrixTree::Leaf(MatrixOp::new_matrix(indices, data).into()),
                 }
@@ -676,8 +774,8 @@ impl<P> Mul for MatrixTree<P> {
     }
 }
 
-// tensor_class!(TensorMatc64, Complex64);
-// tensor_class!(TensorMatc32, Complex32);
+tensor_class!(noscipy, TensorMatc64, Complex64);
+tensor_class!(noscipy, TensorMatc32, Complex32);
 tensor_class!(TensorMatf64, f64);
 tensor_class!(TensorMatf32, f32);
 tensor_class!(TensorMati64, i64);
@@ -687,8 +785,8 @@ tensor_class!(nonegate, TensorMatu32, u32);
 
 #[pymodule]
 fn qubit_matmul(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
-    // m.add_class::<TensorMatc64>()?;
-    // m.add_class::<TensorMatc32>()?;
+    m.add_class::<TensorMatc64>()?;
+    m.add_class::<TensorMatc32>()?;
     m.add_class::<TensorMatf64>()?;
     m.add_class::<TensorMatf32>()?;
     m.add_class::<TensorMati64>()?;
