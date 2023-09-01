@@ -130,11 +130,19 @@ macro_rules! tensor_class {
         #[pymethods]
         impl $name {
             #[new]
-            fn new(indices: Vec<usize>, data: PyReadonlyArray1<$t>) -> Self {
+            fn new(indices: Vec<usize>, data: PyReadonlyArray1<$t>) -> PyResult<Self> {
                 let data = data.to_vec().unwrap();
-                Self {
-                    mat: MatrixTree::Leaf(MatrixOp::new_matrix(indices, data).into()),
+                let expected = (1usize << indices.len()).pow(2);
+                if data.len() != expected {
+                    return Err(PyValueError::new_err(format!(
+                        "Expected matrix with {} entries, found {}",
+                        expected,
+                        data.len()
+                    )));
                 }
+                Ok(Self {
+                    mat: MatrixTree::Leaf(MatrixOp::new_matrix(indices, data).into()),
+                })
             }
 
             fn apply(
