@@ -1,3 +1,6 @@
+mod util;
+
+use crate::util::HashSparse;
 use num_complex::Complex;
 use num_traits::{Num, One, Zero};
 use numpy::ndarray::{Array1, Array2};
@@ -14,6 +17,7 @@ use rayon::prelude::*;
 use sprs::vec::IntoSparseVecIter;
 #[cfg(feature = "sparse")]
 use sprs::*;
+use std::collections::HashMap;
 use std::iter::Sum;
 use std::ops::{Add, AddAssign, DivAssign, Mul, MulAssign, Neg};
 
@@ -70,6 +74,47 @@ macro_rules! tensor_class {
                     self.mat.apply_overwrite(n, input_slice, output_slice);
                     Ok(Some(output.to_pyarray(py).to_owned()))
                 }
+            }
+
+            fn make_hash_sparse(
+                &self,
+                py: Python,
+                n: usize,
+                restrict_rows: Option<Vec<usize>>,
+                sort: Option<bool>,
+            ) -> (Py<PyArray1<usize>>, Py<PyArray1<usize>>, Py<PyArray1<$t>>) {
+                let sort = sort.unwrap_or(false);
+                let rows = restrict_rows.as_ref().map(|x| x.as_slice());
+                let sprs = self.mat.make_hash_sparse(n, rows);
+
+                let nn = sprs.nonempty();
+                let mut vals = Array1::zeros((nn,));
+                let mut rows = Array1::zeros((nn,));
+                let mut cols = Array1::zeros((nn,));
+                if sort {
+                    let mut data = sprs.into_iter_coords().collect::<Vec<_>>();
+                    data.sort_unstable_by_key(|(row, col, _)| (*row, *col));
+                    data.into_iter()
+                        .enumerate()
+                        .for_each(|(i, (row, col, data))| {
+                            rows[i] = row;
+                            cols[i] = col;
+                            vals[i] = data;
+                        });
+                } else {
+                    sprs.into_iter_coords()
+                        .enumerate()
+                        .for_each(|(i, (row, col, data))| {
+                            rows[i] = row;
+                            cols[i] = col;
+                            vals[i] = data;
+                        });
+                }
+
+                let vals = vals.into_pyarray(py).to_owned();
+                let rows = rows.into_pyarray(py).to_owned();
+                let cols = cols.into_pyarray(py).to_owned();
+                (rows, cols, vals)
             }
 
             #[cfg(feature = "sparse")]
@@ -154,16 +199,59 @@ macro_rules! tensor_class {
     (scipy, $name:ident, $t:ty) => {
         #[pymethods]
         impl $name {
-            #[cfg(feature = "sparse")]
             fn get_sparse<'a>(
                 &self,
                 py: Python<'a>,
                 n: usize,
                 restrict_rows: Option<Vec<usize>>,
+                use_hash: Option<bool>,
+                reindex: Option<bool>,
+            ) -> PyResult<&'a PyAny> {
+                let use_hash = use_hash.unwrap_or(true);
+                if use_hash {
+                    self.get_hash_sparse(py, n, restrict_rows, reindex)
+                } else if cfg!(feature = "sparse") {
+                    self.get_csmat_sparse(py, n, restrict_rows, reindex)
+                } else {
+                    Err(PyValueError::new_err("CsMat sparse feature not enabled"))
+                }
+            }
+
+            #[cfg(feature = "sparse")]
+            fn get_csmat_sparse<'a>(
+                &self,
+                py: Python<'a>,
+                n: usize,
+                restrict_rows: Option<Vec<usize>>,
+                reindex: Option<bool>,
             ) -> PyResult<&'a PyAny> {
                 let rows = restrict_rows.as_ref().map(|x| x.as_slice());
                 let sprs = self.mat.make_sparse(n, rows);
+                let sprs = if reindex.unwrap_or(false) {
+                    reindex_sparse(sprs, rows)
+                } else {
+                    sprs
+                };
                 scipy_mat(py, &sprs)
+                    .map(|e| e)
+                    .map_err(|e| PyValueError::new_err(e))
+            }
+
+            fn get_hash_sparse<'a>(
+                &self,
+                py: Python<'a>,
+                n: usize,
+                restrict_rows: Option<Vec<usize>>,
+                reindex: Option<bool>,
+            ) -> PyResult<&'a PyAny> {
+                let rows = restrict_rows.as_ref().map(|x| x.as_slice());
+                let sprs = self.mat.make_hash_sparse(n, rows);
+                let sprs = if reindex.unwrap_or(false) {
+                    reindex_hash_sparse(sprs, rows)
+                } else {
+                    sprs
+                };
+                scipy_coo_mat(py, &sprs)
                     .map(|e| e)
                     .map_err(|e| PyValueError::new_err(e))
             }
@@ -224,6 +312,44 @@ where
         })
 }
 
+fn scipy_coo_mat<'a, P>(py: Python<'a>, sprs: &HashSparse<P>) -> Result<&'a PyAny, String>
+where
+    P: Clone + IntoPy<Py<PyAny>> + Zero,
+{
+    let scipy_sparse = PyModule::import(py, "scipy.sparse").map_err(|e| {
+        let res = format!("Python error: {e:?}");
+        e.print_and_set_sys_last_vars(py);
+        res
+    })?;
+
+    let nn = sprs.nonempty();
+    let mut vals = vec![P::zero(); nn];
+    let mut rows = vec![0; nn];
+    let mut cols = vec![0; nn];
+
+    let mut data = sprs.iter_coords().collect::<Vec<_>>();
+    data.sort_unstable_by_key(|(row, col, _)| (*row, *col));
+    data.into_iter()
+        .enumerate()
+        .for_each(|(i, (row, col, data))| {
+            rows[i] = *row;
+            cols[i] = *col;
+            vals[i] = data.clone();
+        });
+
+    scipy_sparse
+        .call_method(
+            "coo_matrix",
+            ((vals, (rows, cols)),),
+            Some([("shape", sprs.shape())].into_py_dict(py)),
+        )
+        .map_err(|e| {
+            let res = format!("Python error: {e:?}");
+            e.print_and_set_sys_last_vars(py);
+            res
+        })
+}
+
 #[derive(Clone)]
 pub enum MatrixTree<P> {
     Leaf(MatrixOp<P>),
@@ -235,6 +361,31 @@ pub enum MatrixTree<P> {
     Div(Box<MatrixTree<P>>, P),
 }
 
+#[cfg(feature = "sparse")]
+fn reindex_sparse<P>(sprs: CsMat<P>, restrict_rows: Option<&[usize]>) -> CsMat<P>
+where
+    P: Add + Num + Copy + Default + MulAcc + Zero + Send + Sync + One + MulAssign + DivAssign,
+{
+    if let Some(rows) = restrict_rows {
+        let mut lookup = HashMap::<usize, usize>::default();
+        rows.iter().enumerate().for_each(|(i, row)| {
+            lookup.insert(*row, i);
+        });
+
+        let mut a = TriMat::new((rows.len(), rows.len()));
+        sprs.into_iter().for_each(|(val, (row, col))| {
+            if let (Some(row), Some(col)) = (lookup.get(&row), lookup.get(&col)) {
+                a.add_triplet(*row, *col, *val)
+            }
+        });
+
+        a.to_csr()
+    } else {
+        sprs
+    }
+}
+
+#[cfg(feature = "sparse")]
 fn filter_sparse<P>(sprs: CsMat<P>, restrict_rows: Option<&[usize]>) -> CsMat<P>
 where
     P: Add + Num + Copy + Default + MulAcc + Zero + Send + Sync + One + MulAssign + DivAssign,
@@ -253,6 +404,96 @@ where
         a.to_csr()
     } else {
         sprs
+    }
+}
+
+fn reindex_hash_sparse<P>(sprs: HashSparse<P>, restrict_rows: Option<&[usize]>) -> HashSparse<P>
+where
+    P: Add + Num + Copy + Default + MulAcc + Zero + Send + Sync + One + MulAssign + DivAssign,
+{
+    if let Some(rows) = restrict_rows {
+        let mut lookup = HashMap::<usize, usize>::default();
+        rows.iter().enumerate().for_each(|(i, row)| {
+            lookup.insert(*row, i);
+        });
+
+        let mut a = sprs.empty_like_shape((rows.len(), rows.len()));
+        sprs.into_iter_coords().for_each(|(row, col, val)| {
+            if let (Some(row), Some(col)) = (lookup.get(&row), lookup.get(&col)) {
+                a.insert(*row, *col, val)
+            }
+        });
+
+        a
+    } else {
+        sprs
+    }
+}
+
+fn filter_hash_sparse<P>(sprs: HashSparse<P>, restrict_rows: Option<&[usize]>) -> HashSparse<P>
+where
+    P: Add + Num + Copy + Default + MulAcc + Zero + Send + Sync + One + MulAssign + DivAssign,
+{
+    if let Some(rows) = restrict_rows {
+        sprs.filter_to_rows(rows)
+    } else {
+        sprs
+    }
+}
+
+impl<P> MatrixTree<P>
+where
+    P: Add + Num + Copy + Default + MulAcc + Zero + Send + Sync + One + MulAssign + DivAssign + Sum,
+    for<'r> &'r P: Add<&'r P, Output = P> + Mul<&'r P, Output = P>,
+{
+    fn make_hash_sparse(&self, n: usize, restrict_rows: Option<&[usize]>) -> HashSparse<P> {
+        match self {
+            MatrixTree::Leaf(op) => make_hash_sparse_from_op(op, n, restrict_rows),
+            MatrixTree::SumLeaf(ops) => ops
+                .iter()
+                .map(|op| make_hash_sparse_from_op(op, n, restrict_rows))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(acc + x),
+                })
+                .unwrap_or_else(|| HashSparse::new_col_major((1 << n, 1 << n))),
+            MatrixTree::Sum(ops) => ops
+                .iter()
+                .map(|op| op.make_hash_sparse(n, restrict_rows))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(acc + x),
+                })
+                .unwrap_or_else(|| HashSparse::new_col_major((1 << n, 1 << n))),
+            MatrixTree::ProdLeaf(ops) => ops
+                .iter()
+                .map(|op| make_hash_sparse_from_op(op, n, None))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(acc.matmul(&x)),
+                })
+                .map(|sprs| filter_hash_sparse(sprs, restrict_rows))
+                .unwrap_or_else(|| HashSparse::new_col_major((1 << n, 1 << n))),
+            MatrixTree::Prod(ops) => ops
+                .iter()
+                .map(|op| op.make_hash_sparse(n, None))
+                .fold(None, |acc, x| match acc {
+                    None => Some(x),
+                    Some(acc) => Some(acc.matmul(&x)),
+                })
+                .map(|sprs| filter_hash_sparse(sprs, restrict_rows))
+                .unwrap_or_else(|| HashSparse::new_col_major((1 << n, 1 << n))),
+            MatrixTree::Mul(tree, mul) => {
+                let mut sparse = tree.make_hash_sparse(n, restrict_rows);
+                sparse.mul_assign(mul);
+                sparse
+            }
+            MatrixTree::Div(tree, div) => {
+                let mut sparse = tree.make_hash_sparse(n, restrict_rows);
+                sparse.div_assign(div);
+                sparse
+            }
+        }
     }
 }
 
@@ -315,7 +556,7 @@ where
 
 fn make_sparse_from_op<P>(op: &MatrixOp<P>, n: usize, restrict_rows: Option<&[usize]>) -> CsMat<P>
 where
-    P: Clone + Zero + One + Num,
+    P: Clone + Zero + One + Num + Default,
 {
     let mut a = TriMat::new((1 << n, 1 << n));
     let nindices = op.num_indices();
@@ -339,8 +580,40 @@ where
     } else {
         (0..1 << n).for_each(f)
     }
-
     a.to_csr()
+}
+
+fn make_hash_sparse_from_op<P>(
+    op: &MatrixOp<P>,
+    n: usize,
+    restrict_rows: Option<&[usize]>,
+) -> HashSparse<P>
+where
+    P: Clone + Zero + One + Num + Default,
+{
+    let mut a = HashSparse::new_row_major((1 << n, 1 << n));
+    let nindices = op.num_indices();
+
+    let mat_indices: Vec<usize> = (0..op.num_indices()).map(|i| get_index(op, i)).collect();
+    let f = |row| {
+        let matrow = full_to_sub(n, &mat_indices, row);
+        act_on_iterator(nindices, matrow, op, |it| {
+            let f = |(i, val): (usize, P)| {
+                let vecrow = sub_to_full(n, &mat_indices, i, row);
+                (vecrow, val)
+            };
+
+            for (col, val) in it.map(f) {
+                a.insert(row, col, val)
+            }
+        })
+    };
+    if let Some(restrict_rows) = restrict_rows {
+        restrict_rows.iter().copied().for_each(f)
+    } else {
+        (0..1 << n).for_each(f)
+    }
+    a
 }
 
 impl<P> MatrixTree<P>
