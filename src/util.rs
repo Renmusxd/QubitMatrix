@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::iter::Sum;
 use std::ops::{Add, Div, DivAssign, Mul, MulAssign};
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum MajorAxis {
     Column,
     Row,
@@ -220,13 +220,31 @@ where
 {
     type Output = Self;
 
-    fn add(self, rhs: Self) -> Self {
-        let mut res = self.clone();
-        rhs.iter_coords().for_each(|(row, col, val)| {
-            let get = res.get_mut(*row, *col);
-            *get = val + get;
-        });
-        res
+    fn add(mut self, rhs: Self) -> Self {
+        if self.major == rhs.major {
+            rhs.data.into_iter().for_each(|(c, d)| {
+                let entry = self.data.entry(c);
+                entry
+                    .and_modify(|selfdat| {
+                        d.iter().for_each(|(k, v)| {
+                            selfdat
+                                .entry(*k)
+                                .and_modify(|selfd| {
+                                    *selfd = v + selfd;
+                                })
+                                .or_insert(v.clone());
+                        });
+                    })
+                    .or_insert(d);
+            });
+            self
+        } else {
+            rhs.into_iter_coords().for_each(|(row, col, val)| {
+                let get = self.get_mut(row, col);
+                *get = val + get.clone();
+            });
+            self
+        }
     }
 }
 

@@ -5,11 +5,12 @@ use num_complex::Complex;
 use num_traits::{Num, One, Zero};
 use numpy::ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadwriteArray1, ToPyArray};
+use pyo3::Python;
+use pyo3::conversion::IntoPyObject;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
-use pyo3::Python;
-use qip_iterators::iterators::{act_on_iterator, MatrixOp};
+use qip_iterators::iterators::{MatrixOp, act_on_iterator};
 use qip_iterators::matrix_ops::{
     apply_op, apply_op_overwrite, apply_op_row, full_to_sub, get_index, sub_to_full,
 };
@@ -33,7 +34,7 @@ macro_rules! tensor_class {
         impl $name {
             #[new]
             fn new(indices: Vec<usize>, data: PyReadonlyArray1<$t>) -> PyResult<Self> {
-                let data = data.to_vec().unwrap();
+                let data = data.as_slice().unwrap().to_vec();
                 let expected = (1usize << indices.len()).pow(2);
                 if data.len() != expected {
                     return Err(PyValueError::new_err(format!(
@@ -47,12 +48,13 @@ macro_rules! tensor_class {
                 })
             }
 
-            fn apply(
+            #[pyo3(signature = (input, output=None))]
+            fn apply<'a>(
                 &self,
-                py: Python,
+                py: Python<'a>,
                 input: PyReadonlyArray1<$t>,
                 output: Option<PyReadwriteArray1<$t>>,
-            ) -> PyResult<Option<Py<PyArray1<$t>>>> {
+            ) -> PyResult<Option<Bound<'a, PyArray1<$t>>>> {
                 let input_slice = input
                     .as_slice()
                     .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
@@ -76,13 +78,18 @@ macro_rules! tensor_class {
                 }
             }
 
-            fn make_hash_sparse(
+            #[pyo3(signature = (n, restrict_rows=None, sort=None))]
+            fn make_hash_sparse<'a>(
                 &self,
-                py: Python,
+                py: Python<'a>,
                 n: usize,
                 restrict_rows: Option<Vec<usize>>,
                 sort: Option<bool>,
-            ) -> (Py<PyArray1<usize>>, Py<PyArray1<usize>>, Py<PyArray1<$t>>) {
+            ) -> (
+                Bound<'a, PyArray1<usize>>,
+                Bound<'a, PyArray1<usize>>,
+                Bound<'a, PyArray1<$t>>,
+            ) {
                 let sort = sort.unwrap_or(false);
                 let rows = restrict_rows.as_ref().map(|x| x.as_slice());
                 let sprs = self.mat.make_hash_sparse(n, rows);
@@ -118,12 +125,17 @@ macro_rules! tensor_class {
             }
 
             #[cfg(feature = "sparse")]
-            fn make_sparse(
+            #[pyo3(signature = (n, restrict_rows=None))]
+            fn make_sparse<'a>(
                 &self,
-                py: Python,
+                py: Python<'a>,
                 n: usize,
                 restrict_rows: Option<Vec<usize>>,
-            ) -> (Py<PyArray1<usize>>, Py<PyArray1<usize>>, Py<PyArray1<$t>>) {
+            ) -> (
+                Bound<'a, PyArray1<usize>>,
+                Bound<'a, PyArray1<usize>>,
+                Bound<'a, PyArray1<$t>>,
+            ) {
                 let rows = restrict_rows.as_ref().map(|x| x.as_slice());
                 let sprs = self.mat.make_sparse(n, rows);
 
@@ -144,7 +156,7 @@ macro_rules! tensor_class {
                 (rows, cols, vals)
             }
 
-            fn get_dense(&self, py: Python, n: usize) -> Py<PyArray2<$t>> {
+            fn get_dense<'a>(&self, py: Python<'a>, n: usize) -> Bound<'a, PyArray2<$t>> {
                 self.mat.make_dense(n).into_pyarray(py).to_owned()
             }
 
@@ -199,6 +211,7 @@ macro_rules! tensor_class {
     (scipy, $name:ident, $t:ty) => {
         #[pymethods]
         impl $name {
+            #[pyo3(signature = (n, restrict_rows=None, use_hash=None, reindex=None))]
             fn get_sparse<'a>(
                 &self,
                 py: Python<'a>,
@@ -206,7 +219,7 @@ macro_rules! tensor_class {
                 restrict_rows: Option<Vec<usize>>,
                 use_hash: Option<bool>,
                 reindex: Option<bool>,
-            ) -> PyResult<&'a PyAny> {
+            ) -> PyResult<Bound<'a, PyAny>> {
                 let use_hash = use_hash.unwrap_or(true);
                 if use_hash {
                     self.get_hash_sparse(py, n, restrict_rows, reindex)
@@ -218,13 +231,14 @@ macro_rules! tensor_class {
             }
 
             #[cfg(feature = "sparse")]
+            #[pyo3(signature = (n, restrict_rows=None, reindex=None))]
             fn get_csmat_sparse<'a>(
                 &self,
                 py: Python<'a>,
                 n: usize,
                 restrict_rows: Option<Vec<usize>>,
                 reindex: Option<bool>,
-            ) -> PyResult<&'a PyAny> {
+            ) -> PyResult<Bound<'a, PyAny>> {
                 let rows = restrict_rows.as_ref().map(|x| x.as_slice());
                 let sprs = self.mat.make_sparse(n, rows);
                 let sprs = if reindex.unwrap_or(false) {
@@ -237,13 +251,14 @@ macro_rules! tensor_class {
                     .map_err(|e| PyValueError::new_err(e))
             }
 
+            #[pyo3(signature = (n, restrict_rows=None, reindex=None))]
             fn get_hash_sparse<'a>(
                 &self,
                 py: Python<'a>,
                 n: usize,
                 restrict_rows: Option<Vec<usize>>,
                 reindex: Option<bool>,
-            ) -> PyResult<&'a PyAny> {
+            ) -> PyResult<Bound<'a, PyAny>> {
                 let rows = restrict_rows.as_ref().map(|x| x.as_slice());
                 let sprs = self.mat.make_hash_sparse(n, rows);
                 let sprs = if reindex.unwrap_or(false) {
@@ -289,9 +304,9 @@ fn two_power(x: usize) -> u32 {
 }
 
 #[cfg(feature = "sparse")]
-fn scipy_mat<'a, P>(py: Python<'a>, mat: &CsMat<P>) -> Result<&'a PyAny, String>
+fn scipy_mat<'a, P, PyT>(py: Python<'a>, mat: &CsMat<P>) -> Result<Bound<'a, PyAny>, String>
 where
-    P: Clone + IntoPy<Py<PyAny>>,
+    P: Clone + IntoPyObject<'a, Target = PyT>,
 {
     let scipy_sparse = PyModule::import(py, "scipy.sparse").map_err(|e| {
         let res = format!("Python error: {e:?}");
@@ -299,11 +314,12 @@ where
         res
     })?;
     let indptr = mat.indptr().to_proper().to_vec();
+    let dict = [("shape", mat.shape())].into_py_dict(py).unwrap();
     scipy_sparse
         .call_method(
             "csr_matrix",
             ((mat.data().to_vec(), mat.indices().to_vec(), indptr),),
-            Some([("shape", mat.shape())].into_py_dict(py)),
+            Some(&dict),
         )
         .map_err(|e| {
             let res = format!("Python error: {e:?}");
@@ -312,9 +328,12 @@ where
         })
 }
 
-fn scipy_coo_mat<'a, P>(py: Python<'a>, sprs: &HashSparse<P>) -> Result<&'a PyAny, String>
+fn scipy_coo_mat<'a, P, PyT>(
+    py: Python<'a>,
+    sprs: &HashSparse<P>,
+) -> Result<Bound<'a, PyAny>, String>
 where
-    P: Clone + IntoPy<Py<PyAny>> + Zero,
+    P: Clone + IntoPyObject<'a, Target = PyT> + Zero,
 {
     let scipy_sparse = PyModule::import(py, "scipy.sparse").map_err(|e| {
         let res = format!("Python error: {e:?}");
@@ -328,6 +347,7 @@ where
     let mut cols = vec![0; nn];
 
     let mut data = sprs.iter_coords().collect::<Vec<_>>();
+    let dict = [("shape", sprs.shape())].into_py_dict(py).unwrap();
     data.sort_unstable_by_key(|(row, col, _)| (*row, *col));
     data.into_iter()
         .enumerate()
@@ -338,11 +358,7 @@ where
         });
 
     scipy_sparse
-        .call_method(
-            "coo_matrix",
-            ((vals, (rows, cols)),),
-            Some([("shape", sprs.shape())].into_py_dict(py)),
-        )
+        .call_method("coo_matrix", ((vals, (rows, cols)),), Some(&dict))
         .map_err(|e| {
             let res = format!("Python error: {e:?}");
             e.print_and_set_sys_last_vars(py);
@@ -838,10 +854,10 @@ where
             .flat_map(|x| x.iter_mut())
             .for_each(|(_, x)| *x = x.clone().neg()),
         MatrixOp::Swap(_, _) => {
-            return Err("Negating swap operations not yet implemented".to_string())
+            return Err("Negating swap operations not yet implemented".to_string());
         }
         MatrixOp::Control(_, _, _) => {
-            return Err("Negating control operations not yet implemented".to_string())
+            return Err("Negating control operations not yet implemented".to_string());
         }
     }
     Ok(())
@@ -937,7 +953,7 @@ tensor_class!(nonegate, TensorMatu64, u64);
 tensor_class!(nonegate, TensorMatu32, u32);
 
 #[pymodule]
-fn qubit_matmul(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn qubit_matmul(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TensorMatc64>()?;
     m.add_class::<TensorMatc32>()?;
     m.add_class::<TensorMatf64>()?;
